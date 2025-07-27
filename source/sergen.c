@@ -34,6 +34,9 @@
 #define MAX_NAMESPACE_LEN                (64)
 #define MAX_ARRAY_DECLARATION_SIZE_CHARS (256)
 
+/* Max serializable integer size is 64-bits (8 bytes) */
+#define MAX_SERIALIZABLE_INTEGRAL_SIZE (8)
+
 enum CXChildVisitResult base_visitor(CXCursor current_cursor, CXCursor parent_cursor, CXClientData client);
 enum CXChildVisitResult typedef_visitor(CXCursor current_cursor, CXCursor parent_cursor, CXClientData client);
 enum CXVisitorResult    field_visitor(CXCursor current_cursor, CXClientData client);
@@ -58,6 +61,8 @@ bool check_internal_typedef(CXType td_type);
 bool check_typedef_start(CXType td_type, const char *start);
 bool check_user_typedef(CXType td_type);
 bool check_derived_type(CXType td_type);
+bool find_in_vector(cvector_vector_type(int) vec, int item);
+bool is_integral_type(CXType type);
 
 static const char *header_template =
     "/*\n"
@@ -635,7 +640,6 @@ enum CXVisitorResult field_visitor(CXCursor current_cursor, CXClientData client)
 
                 CXCursor    element_cursor    = clang_getTypeDeclaration(element_type);
                 const char *element_type_cstr = clang_getCString(clang_getTypeSpelling(element_type));
-                const char *canon_type_name   = clang_getCString(clang_getTypeSpelling(clang_getCanonicalType(element_type)));
 
                 /* If we've reached here then `element_type` contains the base
                  * type of the array (i.e., the type that is actually contained
@@ -654,7 +658,7 @@ enum CXVisitorResult field_visitor(CXCursor current_cursor, CXClientData client)
                     }
                     else
                     {
-                        fprintf(hfile_hand, "    %s %s%s;\n", canon_type_name, serializable_accessor, array_decl);
+                        fprintf(hfile_hand, "    %s %s%s;\n", element_type_cstr, serializable_accessor, array_decl);
                     }
                 }
                 /* Case 2: array of an anonymous type */
@@ -666,15 +670,15 @@ enum CXVisitorResult field_visitor(CXCursor current_cursor, CXClientData client)
                 /* Case 3: array of all other types */
                 else
                 {
-                    fprintf(hfile_hand, "    %s %s%s;\n", canon_type_name, serializable_accessor, array_decl);
+                    fprintf(hfile_hand, "    %s %s%s;\n", element_type_cstr, serializable_accessor, array_decl);
                 }
 
                 goto add_to_field_vec;
             }
         case CXType_Typedef:
             {
-                CXType      canon_type      = clang_getCanonicalType(cursor_type);
-                const char *canon_type_name = clang_getCString(clang_getTypeSpelling(canon_type));
+                CXType      canon_type        = clang_getCanonicalType(cursor_type);
+                const char *element_type_cstr = clang_getCString(clang_getTypeSpelling(cursor_type));
 
                 // if the typedef is defined in the current file, then we know we
                 // have a serializable version of it
@@ -710,7 +714,7 @@ enum CXVisitorResult field_visitor(CXCursor current_cursor, CXClientData client)
                         // that we don't know how to serialize it
                         if (clang_Location_isInSystemHeader(loc))
                         {
-                            fprintf(hfile_hand, "    // WARNING: unable to serialize field %s %s\n", canon_type_name, serializable_accessor);
+                            fprintf(hfile_hand, "    // WARNING: unable to serialize field %s %s\n", element_type_cstr, serializable_accessor);
                         }
                         else
                         {
@@ -719,7 +723,7 @@ enum CXVisitorResult field_visitor(CXCursor current_cursor, CXClientData client)
                     }
                     else
                     {
-                        fprintf(hfile_hand, "    %s %s;\n", canon_type_name, serializable_accessor);
+                        fprintf(hfile_hand, "    %s %s;\n", element_type_cstr, serializable_accessor);
                     }
                 }
                 goto add_to_field_vec;
@@ -1272,16 +1276,28 @@ void generate_ferry_source(FILE *fhand, const char *namespace)
         fprintf(sfile_hand, "void %s__sergen_ferry_%s(%s__Serializable%s *senum, %s *nenum) {\n", namespace, cur_penum.name, namespace, cur_penum.name, cur_penum.name);
         fprintf(sfile_hand, "    switch (*nenum) {\n");
 
+        // keep track of seen values
+        cvector_vector_type(int) seen_values = NULL;
+
         // iterate over each field and its value
         for (size_t j = 0; j < cvector_size(cur_penum.enum_field_vector); j++)
         {
             ParsedEnumField cur_penum_field = cur_penum.enum_field_vector[j];
+
+            /* Check if we've seen the current field's value before and if we
+             * have then skip generating the case statement for it. */
+            if (find_in_vector(seen_values, cur_penum_field.id))
+            {
+                continue;
+            }
+
             fprintf(sfile_hand, "        case %s:\n", cur_penum_field.name);
             fprintf(sfile_hand, "        {\n");
             fprintf(sfile_hand, "            senum->label = \"%s\";\n", cur_penum_field.name);
             fprintf(sfile_hand, "            senum->id = %d;\n", cur_penum_field.id);
             fprintf(sfile_hand, "            break;\n");
             fprintf(sfile_hand, "        }\n");
+            cvector_push_back(seen_values, cur_penum_field.id);
         }
 
         fprintf(sfile_hand, "        default: senum->label = \"INVALID\";\n");
@@ -1289,6 +1305,19 @@ void generate_ferry_source(FILE *fhand, const char *namespace)
         fprintf(sfile_hand, "    }\n");
         fprintf(sfile_hand, "}\n\n");
     }
+}
+
+bool find_in_vector(cvector_vector_type(int) vec, int item)
+{
+    int *it = NULL;
+    cvector_for_each_in(it, vec)
+    {
+        if (*it == item)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -1373,16 +1402,27 @@ void generate_pack_source(const char *header_file_path, const char *namespace)
 
                 case CXType_Typedef:
                     {
+                        CXType canon_type = clang_getCanonicalType(cur_field.type);
+
                         char buf[128] = {0};
                         snprintf(buf, 128, "%s__Serializable", namespace);
+
                         if (check_typedef_start(cur_field.type, buf))
                         {
                             fprintf(sfile_hand, "so?");
                             cur_field.complex_type = true;
                             cvector_push_back(serializable_fields, cur_field);
-                            break;
                         }
-                        printf("WARNING [CXType_Typedef]: cannot pack field %s in struct %s!\n", cur_field.name, cur_struct.name);
+                        /* If we have a integral typedef, then serialize it differently. */
+                        else if (is_integral_type(canon_type) && clang_Type_getSizeOf(canon_type) <= MAX_SERIALIZABLE_INTEGRAL_SIZE)
+                        {
+                            fprintf(sfile_hand, "sI");
+                            cvector_push_back(serializable_fields, cur_field);
+                        }
+                        else
+                        {
+                            printf("WARNING [CXType_Typedef]: cannot pack field %s in struct %s!\n", cur_field.name, cur_struct.name);
+                        }
                         break;
                     }
 
@@ -1459,6 +1499,8 @@ void generate_pack_source(const char *header_file_path, const char *namespace)
                 ParsedStructField cur_field = serializable_fields[f];
                 fprintf(sfile_hand, "        \"%s\",\n", cur_field.name);
 
+                bool is_serializable_integral_typedef = is_integral_type(clang_getCanonicalType(cur_field.type)) && clang_Type_getSizeOf(cur_field.type) <= MAX_SERIALIZABLE_INTEGRAL_SIZE;
+
                 // if the type is another struct, then call the pack function for that type
                 if (cur_field.complex_type)
                 {
@@ -1481,7 +1523,8 @@ void generate_pack_source(const char *header_file_path, const char *namespace)
                         fprintf(sfile_hand, "        NULL");
                     }
                 }
-                else if (cur_field.type.kind >= CXType_Char_U && cur_field.type.kind <= CXType_LongLong)
+                /* If the type is an integral type or a typedef of an integral type... */
+                else if (is_integral_type(cur_field.type) || is_serializable_integral_typedef)
                 {
                     fprintf(sfile_hand, "        (json_int_t)sstruct->%s", cur_field.name);
                 }
@@ -1547,15 +1590,20 @@ void generate_pack_source(const char *header_file_path, const char *namespace)
                 fprintf(sfile_hand, "        \n");
                 switch (base_field_type.kind)
                 {
+                    case CXType_Bool:
+                        {
+                            fprintf(sfile_hand, "        json_t *elem = json_boolean( (bool)(sstruct->%s[i]) );\n", cur_field.name);
+                            break;
+                        }
+                    case CXType_Char_U ... CXType_LongLong:
+                        {
+                            fprintf(sfile_hand, "        json_t *elem = json_integer( (json_int_t)( ((%s *)sstruct->%s)[i] ) );\n", base_field_type_spell_cstr, cur_field.name);
+                            break;
+                        }
                     case CXType_Float ... CXType_Double:
                         {
 
-                            fprintf(sfile_hand, "        json_t *elem = json_real( ((double *)sstruct->%s)[i] );\n", cur_field.name);
-                            break;
-                        }
-                    case CXType_Char_U ... CXType_Int:
-                        {
-                            fprintf(sfile_hand, "        json_t *elem = json_integer( (json_int_t)( ((%s *)sstruct->%s)[i] ) );\n", base_field_type_spell_cstr, cur_field.name);
+                            fprintf(sfile_hand, "        json_t *elem = json_real( ((%s *)sstruct->%s)[i] );\n", base_field_type_spell_cstr, cur_field.name);
                             break;
                         }
                     case CXType_Pointer:
@@ -1571,9 +1619,21 @@ void generate_pack_source(const char *header_file_path, const char *namespace)
                             }
                             break;
                         }
-                    case CXType_Bool:
+                    case CXType_Typedef:
                         {
-                            fprintf(sfile_hand, "        json_t *elem = json_boolean( (bool)(sstruct->%s[i]) );\n", cur_field.name);
+                            CXType    canonical_type = clang_getCanonicalType(base_field_type);
+                            long long type_size      = clang_Type_getSizeOf(base_field_type);
+                            /* If the canonical type is integral (stdint.h
+                             * types) and the size is less than or equal to 64,
+                             * then we serialize accordingly */
+                            if (is_integral_type(canonical_type) && type_size <= MAX_SERIALIZABLE_INTEGRAL_SIZE)
+                            {
+                                fprintf(sfile_hand, "        json_t *elem = json_integer( (json_int_t)( ((%s *)sstruct->%s)[i] ) );\n", base_field_type_spell_cstr, cur_field.name);
+                            }
+                            else
+                            {
+                                fprintf(sfile_hand, "        json_t *elem = NULL;\n");
+                            }
                             break;
                         }
                     default:
@@ -1608,6 +1668,18 @@ void generate_pack_source(const char *header_file_path, const char *namespace)
 
     // dispose of the translation unit and index
     clang_disposeTranslationUnit(unit);
+}
+
+bool is_integral_type(CXType type)
+{
+    switch (type.kind)
+    {
+        case CXType_Char_U ... CXType_LongLong:
+            return true;
+        default:
+            return false;
+    }
+    return false;
 }
 
 void generate_header_file(CXTranslationUnit unit, const char *namespace)
