@@ -382,17 +382,17 @@ int main(int argc, char **argv)
 
     // open header file for write
     hfile_hand = fopen(output_header_name, "w");
-    if (errno)
+    if (hfile_hand == NULL)
     {
-        printf("Unable to open file: \"%s\", errno=%d\n", output_header_name, errno);
+        printf("Unable to open file: \"%s\", errno=%d\n: %s", output_header_name, errno, strerror(errno));
         exit(1);
     }
 
     // open source file for write
     sfile_hand = fopen(output_source_name, "w");
-    if (errno)
+    if (sfile_hand == NULL)
     {
-        printf("Unable to open file: \"%s\", errno=%d\n", output_source_name, errno);
+        printf("Unable to open file: \"%s\", errno=%d\n: %s", output_source_name, errno, strerror(errno));
         exit(1);
     }
 
