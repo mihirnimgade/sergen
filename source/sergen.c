@@ -1,6 +1,6 @@
 #include "c-vector/cvector.h"
 #include "c-vector/cvector_utils.h"
-#include <clang-c/Index.h>
+#include "clang-c/Index.h"
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>

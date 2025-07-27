@@ -18,6 +18,7 @@ target_include_directories(
   sergen PRIVATE
   include/
   libs/
+  libs/libclang
 )
 target_compile_options(sergen PRIVATE -g)
 target_link_libraries(sergen libclang)
