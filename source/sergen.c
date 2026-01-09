@@ -1,6 +1,4 @@
-#include "c-vector/cvector.h"
-#include "c-vector/cvector_utils.h"
-#include "clang-c/Index.h"
+#include <clang-c/Index.h>
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
@@ -9,6 +7,9 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "c-vector/cvector.h"
+#include "c-vector/cvector_utils.h"
 
 // LIMITATION: the user must provide header files in a specific order so that
 // sergen is able to correctly generate serializable struct definitions and
@@ -27,7 +28,7 @@
 // `$ sergen parent1.h parent2.h user.h`
 //
 // Note that if `parent1.h` and `parent2.h` themselves include other header
-// files, these included header files must occur before `parent1.h` and
+// files, thesincluded header files must occur before `parent1.h` and
 // `parent2.h`. This happens recursively until you reach a standalone set of
 // header files at the beginning of your `sergen` command.
 
@@ -37,9 +38,30 @@
 /* Max serializable integer size is 64-bits (8 bytes) */
 #define MAX_SERIALIZABLE_INTEGRAL_SIZE (8)
 
+typedef enum
+{
+    PROTOBUF_3_TYPE_INVALID = 0,
+    PROTOBUF_3_TYPE_DOUBLE,
+    PROTOBUF_3_TYPE_FLOAT,
+    PROTOBUF_3_TYPE_INT32,
+    PROTOBUF_3_TYPE_INT64,
+    PROTOBUF_3_TYPE_UINT32,
+    PROTOBUF_3_TYPE_UINT64,
+    PROTOBUF_3_TYPE_SINT32,
+    PROTOBUF_3_TYPE_SINT64,
+    PROTOBUF_3_TYPE_FIXED32,
+    PROTOBUF_3_TYPE_FIXED64,
+    PROTOBUF_3_TYPE_SFIXED32,
+    PROTOBUF_3_TYPE_SFIXED64,
+    PROTOBUF_3_TYPE_BOOL,
+    PROTOBUF_3_TYPE_STRING,
+    PROTOBUF_3_TYPE_BYTES,
+} Protobuf3Type;
+
 enum CXChildVisitResult base_visitor(CXCursor current_cursor, CXCursor parent_cursor, CXClientData client);
 enum CXChildVisitResult typedef_visitor(CXCursor current_cursor, CXCursor parent_cursor, CXClientData client);
 enum CXVisitorResult    field_visitor(CXCursor current_cursor, CXClientData client);
+enum CXVisitorResult    field_visitor_to_protobuf(CXCursor current_cursor, CXClientData client);
 enum CXChildVisitResult enum_field_visitor(CXCursor current_cursor, CXCursor parent_cursor, CXClientData client);
 enum CXChildVisitResult field_annotation_visitor(CXCursor current_cursor, CXCursor parent_cursor, CXClientData client);
 enum CXChildVisitResult struct_packed_visitor(CXCursor current_cursor, CXCursor parent_cursor, CXClientData client);
@@ -49,13 +71,21 @@ enum CXVisitorResult    stage_two_field_visitor(CXCursor current_cursor, CXClien
 
 void generate_header_file(CXTranslationUnit unit, const char *namespace);
 void generate_ferry_source(FILE *fhand, const char *namespace);
-void generate_pack_source(const char *header_file_path, const char *namespace);
+void generate_pack_source(const char *header_file_path, const char *namespace, int parse_argc, const char **parse_argv);
 void generate_desired_includes(FILE *fh, cvector_vector_type(char *) header_files, cvector_vector_type(char *) include_directories);
+void generate_protobuf_schema(FILE *fhand, const char *namespace);
 
 char *generate_serializable_field_accessor(cvector_vector_type(const char *) field_ref);
 char *generate_native_field_accessor(cvector_vector_type(const char *) field_ref);
 
 void char_ptr_destructor(void *buf);
+
+ssize_t sergen_calculate_array_len(CXType array);
+CXType  sergen_get_array_base_type(CXType array);
+
+Protobuf3Type sergen_base_c_type_to_protobuf_rec(const CXType *parent_type, CXType type);
+Protobuf3Type sergen_base_c_type_to_protobuf(CXType type);
+const char   *sergen_protobuf_type_as_cstr(Protobuf3Type type);
 
 bool check_internal_typedef(CXType td_type);
 bool check_typedef_start(CXType td_type, const char *start);
@@ -168,7 +198,7 @@ typedef struct
 {
     ParsedStruct *pstruct;
     bool          is_anonymous;
-    const char *namespace;
+    const char   *namespace;
     cvector_vector_type(const char *) field_ref;
 } FieldVisitorData;
 
@@ -178,8 +208,16 @@ typedef struct
     bool       annotated;
 } EnumFieldVisitorData;
 
+typedef struct
+{
+    const char *namespace;
+    FILE       *pfile;
+    cvector_vector_type(const char *) field_ref;
+} FieldVisitorProtobufData;
+
 static FILE *hfile_hand;
 static FILE *sfile_hand;
+static FILE *pfile_hand;
 
 // create relevant global dynamic vectors
 static cvector_vector_type(CXCursor) enum_list              = NULL;
@@ -188,7 +226,8 @@ static cvector_vector_type(CXCursor) typedef_list           = NULL;
 static cvector_vector_type(ParsedStruct) parsed_struct_list = NULL;
 static cvector_vector_type(ParsedEnum) parsed_enum_list     = NULL;
 
-static const char *include_option = "-I";
+static const char *include_option            = "-I";
+static const char *compile_definition_option = "-D";
 
 static CXIndex libclang_index;
 
@@ -302,36 +341,46 @@ void generate_desired_includes(FILE *fh, cvector_vector_type(char *) header_file
 
 int main(int argc, char **argv)
 {
-    int output_header_name_provided = false;
-    int output_source_name_provided = false;
-    int namespace_provided          = false;
+    int output_header_name_provided   = false;
+    int output_source_name_provided   = false;
+    int output_protobuf_name_provided = false;
+    int namespace_provided            = false;
 
-    char output_header_name[PATH_MAX] = {0};
-    char output_source_name[PATH_MAX] = {0};
-    char namespace[MAX_NAMESPACE_LEN] = {0};
+    char output_header_name[PATH_MAX]   = {0};
+    char output_source_name[PATH_MAX]   = {0};
+    char output_protobuf_name[PATH_MAX] = {0};
+    char namespace[MAX_NAMESPACE_LEN]   = {0};
 
     cvector_vector_type(char *) include_directories = NULL;
     cvector_init(include_directories, 16, elem_destructor);
+
+    cvector_vector_type(char *) compile_definitions = NULL;
+    cvector_init(compile_definitions, 16, elem_destructor);
 
     /* parse arguments */
     int c = -1;
     while (1)
     {
         static struct option sergen_options[] = {
-            {"output-header", required_argument, NULL, 'H'},
-            {"output-source", required_argument, NULL, 'S'},
-            {"include-dir",   required_argument, NULL, 'I'},
-            {"namespace",     required_argument, NULL, 'n'},
-            {0,               0,                 0,    0  }
+            {"output-header",   required_argument, NULL, 'H'},
+            {"output-source",   required_argument, NULL, 'S'},
+            {"include-dir",     required_argument, NULL, 'I'},
+            {"definition",      required_argument, NULL, 'D'},
+            {"namespace",       required_argument, NULL, 'n'},
+            {"output-protobuf", required_argument, NULL, 'P'},
+            {0,                 0,                 0,    0  }
         };
 
         int opt_index = 0;
-        c             = getopt_long(argc, argv, "H:S:I:n:", sergen_options, &opt_index);
+        c             = getopt_long(argc, argv, "H:S:D:I:n:", sergen_options, &opt_index);
 
         if (c == -1)
         {
             break;
         }
+
+        int   optarg_len = 0;
+        char *buf        = 0;
 
         switch (c)
         {
@@ -344,17 +393,27 @@ int main(int argc, char **argv)
                 output_header_name_provided = true;
                 break;
             case 'I':
-                (void)0;
-                int optarg_len = strlen(optarg);
                 // allocate space for the include directory path string
-                char *buf = (char *)calloc(optarg_len + 1, sizeof(char));
+                optarg_len = strlen(optarg);
+                buf        = (char *)calloc(optarg_len + 1, sizeof(char));
                 snprintf(buf, optarg_len + 1, "%s", optarg);
                 cvector_push_back(include_directories, buf);
+                break;
+            case 'P':
+                snprintf(output_protobuf_name, PATH_MAX, "%s", optarg);
+                output_protobuf_name_provided = true;
                 break;
             case 'n':
                 // store namespace
                 snprintf(namespace, MAX_NAMESPACE_LEN, "%s", optarg);
                 namespace_provided = true;
+                break;
+            case 'D':
+                // allocate space for the compile definition string
+                optarg_len = strlen(optarg);
+                buf        = (char *)calloc(optarg_len + 1, sizeof(char));
+                snprintf(buf, optarg_len + 1, "%s", optarg);
+                cvector_push_back(compile_definitions, buf);
                 break;
             case '?':
                 break;
@@ -382,17 +441,24 @@ int main(int argc, char **argv)
 
     // open header file for write
     hfile_hand = fopen(output_header_name, "w");
-    if (hfile_hand == NULL)
+    if (errno)
     {
-        printf("Unable to open file: \"%s\", errno=%d\n: %s", output_header_name, errno, strerror(errno));
+        printf("Unable to open file: \"%s\", errno=%d\n", output_header_name, errno);
         exit(1);
     }
 
     // open source file for write
     sfile_hand = fopen(output_source_name, "w");
-    if (sfile_hand == NULL)
+    if (errno)
     {
-        printf("Unable to open file: \"%s\", errno=%d\n: %s", output_source_name, errno, strerror(errno));
+        printf("Unable to open file: \"%s\", errno=%d\n", output_source_name, errno);
+        exit(1);
+    }
+
+    pfile_hand = fopen(output_protobuf_name, "w");
+    if (errno)
+    {
+        printf("Unable to open file: \"%s\", errno=%d\n", output_protobuf_name, errno);
         exit(1);
     }
 
@@ -454,6 +520,12 @@ int main(int argc, char **argv)
         cvector_push_back(parse_argv, include_option);
         cvector_push_back(parse_argv, *dir_ptr);
     }
+    char **def_ptr = NULL;
+    cvector_for_each_in(def_ptr, compile_definitions)
+    {
+        cvector_push_back(parse_argv, compile_definition_option);
+        cvector_push_back(parse_argv, *def_ptr);
+    }
 
     size_t parse_argv_size = cvector_size(parse_argv);
 
@@ -483,6 +555,7 @@ int main(int argc, char **argv)
 
         generate_header_file(unit, namespace);
         generate_ferry_source(sfile_hand, namespace);
+        generate_protobuf_schema(pfile_hand, namespace);
 
         // clear the global lists so we can use it in the second stage
         cvector_clear(typedef_list);
@@ -509,7 +582,7 @@ int main(int argc, char **argv)
     // STAGE 2 GENERATION: generates the pack functions using the generated header file from stage 1.
     // This need only be done once since we only generated a single header file `serializer.h` from stage 1.
 
-    generate_pack_source(output_header_name, namespace);
+    generate_pack_source(output_header_name, namespace, parse_argv_size, parse_argv);
 
     printf("[SERGEN]: successfully generated serializer source file %s\n", output_source_name);
 
@@ -1326,10 +1399,10 @@ bool find_in_vector(cvector_vector_type(int) vec, int item)
  * @param[in] fhand - Clang `CXType` object representing the relevant typedef.
  * This file handle must be valid and open.
  */
-void generate_pack_source(const char *header_file_path, const char *namespace)
+void generate_pack_source(const char *header_file_path, const char *namespace, int parse_argc, const char **parse_argv)
 {
     CXTranslationUnit unit;
-    enum CXErrorCode  rc = clang_parseTranslationUnit2(libclang_index, header_file_path, NULL, 0, NULL, 0, 0, &unit);
+    enum CXErrorCode  rc = clang_parseTranslationUnit2(libclang_index, header_file_path, parse_argv, parse_argc, NULL, 0, 0, &unit);
     if (rc != CXError_Success)
     {
         printf("[SERGEN]: error, unable to parse following header file: %s\n", header_file_path);
@@ -1386,6 +1459,14 @@ void generate_pack_source(const char *header_file_path, const char *namespace)
         cvector_vector_type(ParsedStructField) serializable_fields = NULL;
         cvector_vector_type(ParsedStructField) array_fields        = NULL;
 
+        // if we have zero fields in our struct, then make sure to mark the
+        // argument with (void) to prevent unused variable errors.
+        if (cvector_size(cur_struct.field_vector) == 0)
+        {
+            fprintf(sfile_hand, "    (void)sstruct;");
+        }
+
+        int unused_fields = 0;
         for (size_t f = 0; f < cvector_size(cur_struct.field_vector); f++)
         {
             ParsedStructField cur_field = cur_struct.field_vector[f];
@@ -1475,6 +1556,7 @@ void generate_pack_source(const char *header_file_path, const char *namespace)
 
                 default:
                     {
+                        unused_fields++;
                         // basically do nothing?
                         // this shouldn't ever happen technically
                         printf("WARNING [default]: cannot pack field \"%s\" (type: %s, num: %d) in struct %s!\n", cur_field.name, type_name, cur_field.type.kind, cur_struct.name);
@@ -1484,6 +1566,13 @@ void generate_pack_source(const char *header_file_path, const char *namespace)
         }
 
         fprintf(sfile_hand, "}\";\n\n");
+
+        // if we don't serialize any fields in our struct, then make sure to
+        // mark the argument with (void) to prevent unused variable errors.
+        if (cvector_size(cur_struct.field_vector) == 0)
+        {
+            fprintf(sfile_hand, "    (void)sstruct;");
+        }
 
         // step 3: generate the `json_pack_ex` call and calls to other pack functions if necessary
 
@@ -1769,4 +1858,374 @@ void generate_header_file(CXTranslationUnit unit, const char *namespace)
         // now we have a valid parsed struct instance, add it to the list so it can be used later
         cvector_push_back(parsed_struct_list, parsed_struct);
     }
+}
+
+/**
+ * @brief Generate the protobuf schema (compatible with nanopb compiler) using
+ * global struct and enum vectors. Should be called after parsing structs and
+ * enums from the header file.
+ *
+ * @param[in] fhand - Clang `CXType` object representing the relevant typedef.
+ * @param[in] header_unit - Translation unit representing the header file to generate ferry functions from.
+ */
+void generate_protobuf_schema(FILE *fhand, const char *namespace)
+{
+    /* TODO: Set up the client data and run the field visitor */
+    /* TODO: Take in the translation unit */
+}
+
+enum CXVisitorResult field_visitor_to_protobuf(CXCursor current_cursor, CXClientData client)
+{
+    /* This function is meant to iterate over a `CXType` object with kind `CXType_Record` */
+    CXType cursor_type = clang_getCursorType(current_cursor);
+
+    CXString    name_spelling      = clang_getCursorSpelling(current_cursor);
+    const char *name_spelling_cstr = clang_getCString(name_spelling);
+
+    CXString    cursor_type_spelling = clang_getTypeSpelling(cursor_type);
+    const char *cursor_type_cstr     = clang_getCString(cursor_type_spelling);
+
+    /* Unpack the client data */
+    /* TODO: Place tag number in the client data */
+    FieldVisitorProtobufData *inner_client = (FieldVisitorProtobufData *)(client);
+    FILE                     *fh           = inner_client->pfile;
+
+    // temporarily place the leaf field name into the field reference vector
+    // so that we generate the correct accessor
+    cvector_push_back(inner_client->field_ref, name_spelling_cstr);
+    char *serializable_accessor = generate_serializable_field_accessor(inner_client->field_ref);
+    cvector_pop_back(inner_client->field_ref);
+
+    const char *namespace = inner_client->namespace;
+
+    switch (cursor_type.kind)
+    {
+        case CXType_ConstantArray:
+            {
+                CXType      element_type      = sergen_get_array_base_type(cursor_type);
+                CXCursor    element_cursor    = clang_getTypeDeclaration(element_type);
+                const char *element_type_cstr = clang_getCString(clang_getTypeSpelling(element_type));
+
+                /* Figure out the total length of the array */
+                ssize_t total_array_len = sergen_calculate_array_len(cursor_type);
+
+                /* If we've reached here then `element_type` contains the base
+                 * type of the array (i.e., the type that is actually contained
+                 * within the array) */
+
+                /* Compute the relevant basic protobuf type */
+                Protobuf3Type protobuf_type      = sergen_base_c_type_to_protobuf(element_type);
+                const char   *protobuf_type_cstr = sergen_protobuf_type_as_cstr(protobuf_type);
+
+                /* Case 1: array of a typedef'd type */
+                if (element_type.kind == CXType_Typedef)
+                {
+                    if (!check_user_typedef(element_type) && check_derived_type(element_type))
+                    {
+                        fprintf(fh, "    // WARNING: unable to create field for derived type defined in system header\n");
+                    }
+                    else
+                    {
+                        fprintf(fh, "    repeated %s PHOTON_FIELD__%s_%s = %d [(nanopb).max_length = %d];\n", protobuf_type_cstr, namespace, serializable_accessor, tag, total_array_len);
+                    }
+                }
+                /* Case 2: array of an anonymous type */
+                else if (clang_Cursor_isAnonymous(element_cursor))
+                {
+                    /* TODO: could recurse here but not sure how. Does protobuf even support this kind of thing? */
+                    fprintf(fh, "    // WARNING: constant arrays of anonymous structs are not supported yet\n");
+                }
+                /* Case 3: array of all other types */
+                else
+                {
+                    fprintf(fh, "    repeated %s PHOTON_FIELD__%s_%s = %d [(nanopb).max_length = %d];\n", protobuf_type_cstr, namespace, serializable_accessor, tag, total_array_len);
+                }
+            }
+            break;
+        case CXType_Typedef:
+            {
+                CXType      canon_type        = clang_getCanonicalType(cursor_type);
+                const char *element_type_cstr = clang_getCString(clang_getTypeSpelling(cursor_type));
+
+                // if the typedef is defined in the current file, then we know we
+                // have a serializable version of it
+                if (check_user_typedef(cursor_type))
+                {
+                    // if the typedef's canonical type isn't a record or an
+                    // enum, then we cannot serialize it
+                    if (canon_type.kind == CXType_Record || canon_type.kind == CXType_Enum)
+                    {
+                        fprintf(fh, "    %s PHOTON_FIELD__%s_%s = %d;\n", protobuf_type_cstr, namespace, serializable_accessor, tag);
+                    }
+                    else
+                    {
+                        fprintf(fh, "    // WARNING: unable to serializer field: %s %s\n", cursor_type_cstr, serializable_accessor);
+                    }
+                }
+                else
+                {
+                    // Check whether we have a typedef'd struct or a typedef'd
+                    // enum that could be defined in the current header file or
+                    // another header file in the include path given to clang.
+                    // For now, we're assuming that the user provides the
+                    // necessary header files in the correct order, to allow
+                    // for serialization of struct definitions with fields of
+                    // foreign types.
+                    if (canon_type.kind == CXType_Record || canon_type.kind == CXType_Enum)
+                    {
+                        CXCursor         curs = clang_getTypeDeclaration(canon_type);
+                        CXSourceLocation loc  = clang_getCursorLocation(curs);
+
+                        // if the type is in a system header, we safely assume
+                        // that we don't know how to serialize it
+                        if (clang_Location_isInSystemHeader(loc))
+                        {
+                            fprintf(fh, "    // WARNING: unable to serialize field %s %s\n", element_type_cstr, serializable_accessor);
+                        }
+                        else
+                        {
+                            fprintf(fh, "    %s__Serializable%s %s;\n", namespace, cursor_type_cstr, serializable_accessor);
+                        }
+                    }
+                    else
+                    {
+                        fprintf(fh, "    %s %s;\n", element_type_cstr, serializable_accessor);
+                    }
+                }
+            }
+            break;
+        case CXType_Pointer:
+            {
+                // if it is a regular pointer, then goto default but if it points to a typedef then something else...
+                CXType pointee_type = clang_getPointeeType(cursor_type);
+
+                // TODO: expand this later to include more types
+                // only pass through pointers that don't point to structs or functions
+                if (pointee_type.kind != CXType_Typedef && pointee_type.kind != CXType_FunctionProto && pointee_type.kind != CXType_FunctionNoProto)
+                {
+                    fprintf(fh, "    %s %s;\n", cursor_type_cstr, serializable_accessor);
+                }
+            }
+            break;
+        // we get here when we have a struct field that is an anonymous struct without a field name
+        case CXType_Record:
+            {
+                // the recursion is simpler here since when an anonymous struct
+                // doesn't have a field name, it basically might as well not
+                // exist since field accesses happen exactly the same as if the
+                // anonymous struct wasn't there
+                clang_Type_visitFields(cursor_type, field_visitor, client);
+            }
+            break;
+        // we get here when we have a struct field that is an anonymous struct WITH a field name
+        case CXType_Elaborated:
+            {
+                // the field reference vector keeps track of our recursion
+                // depth and allows us to flatten nested anonymous struct
+                // fields into a single level
+                cvector_push_back(inner_client->field_ref, name_spelling_cstr);
+                clang_Type_visitFields(cursor_type, field_visitor, client);
+                cvector_pop_back(inner_client->field_ref);
+            }
+            break;
+        default:
+            {
+                fprintf(fh, "    %s %s;\n", cursor_type_cstr, serializable_accessor);
+            }
+            break;
+    }
+}
+
+Protobuf3Type sergen_base_c_type_to_protobuf(CXType type)
+{
+    return sergen_base_c_type_to_protobuf_rec(NULL, type);
+}
+
+const char *sergen_protobuf_type_as_cstr(Protobuf3Type type)
+{
+    switch (type)
+    {
+        case PROTOBUF_3_TYPE_INVALID:
+            return NULL;
+        case PROTOBUF_3_TYPE_DOUBLE:
+            return "double";
+        case PROTOBUF_3_TYPE_FLOAT:
+            return "float";
+        case PROTOBUF_3_TYPE_INT32:
+            return "int32";
+        case PROTOBUF_3_TYPE_INT64:
+            return "int64";
+        case PROTOBUF_3_TYPE_UINT32:
+            return "uint32";
+        case PROTOBUF_3_TYPE_UINT64:
+            return "uint64";
+        case PROTOBUF_3_TYPE_SINT32:
+            return "sint32";
+        case PROTOBUF_3_TYPE_SINT64:
+            return "sint64";
+        case PROTOBUF_3_TYPE_FIXED32:
+            return "fixed32";
+        case PROTOBUF_3_TYPE_FIXED64:
+            return "fixed64";
+        case PROTOBUF_3_TYPE_SFIXED32:
+            return "sfixed32";
+        case PROTOBUF_3_TYPE_SFIXED64:
+            return "sfixed64";
+        case PROTOBUF_3_TYPE_BOOL:
+            return "bool";
+        case PROTOBUF_3_TYPE_STRING:
+            return "string";
+        case PROTOBUF_3_TYPE_BYTES:
+            return "bytes";
+    }
+}
+
+Protobuf3Type sergen_base_c_type_to_protobuf_rec(const CXType *parent_type, CXType type)
+{
+    CXType canonical = clang_getCanonicalType(type);
+    int    type_size = clang_Type_getSizeOf(canonical);
+
+    // u- PROTOBUF_3_TYPE_DOUBLE,
+    // u- PROTOBUF_3_TYPE_FLOAT,
+    // u- PROTOBUF_3_TYPE_INT32,
+    // u- PROTOBUF_3_TYPE_INT64,
+    // s- PROTOBUF_3_TYPE_UINT32,
+    // s- PROTOBUF_3_TYPE_UINT64,
+    // PROTOBUF_3_TYPE_SINT32,
+    // PROTOBUF_3_TYPE_SINT64,
+    // s- PROTOBUF_3_TYPE_FIXED32,
+    // s- PROTOBUF_3_TYPE_FIXED64,
+    // s- PROTOBUF_3_TYPE_SFIXED32,
+    // s- PROTOBUF_3_TYPE_SFIXED64,
+    // u- PROTOBUF_3_TYPE_BOOL,
+    // u- PROTOBUF_3_TYPE_STRING,
+    // s- PROTOBUF_3_TYPE_BYTES,
+
+    switch (canonical.kind)
+    {
+        case CXType_Bool:
+            return PROTOBUF_3_TYPE_BOOL;
+
+        /* Unsigned types */
+        case CXType_Char_U:
+        case CXType_UChar:
+            {
+                /* Special case of a char[]. Technically, this could also be a
+                 * byte array, but there's really no way to tell unless there's
+                 * a source code annotation somewhere. So until then, assume
+                 * it's a string. */
+                if (parent_type != NULL)
+                {
+                    if ((*parent_type).kind == CXType_ConstantArray)
+                    {
+                        return PROTOBUF_3_TYPE_STRING;
+                    }
+                }
+            }
+        case CXType_Char16:
+        case CXType_Char32:
+        case CXType_UShort:
+        case CXType_UInt:
+        case CXType_ULong:
+        case CXType_ULongLong:
+            {
+                /* TODO: Finish this implementation */
+                if (type_size == 64)
+                {
+                    return PROTOBUF_3_TYPE_INT64;
+                }
+                else if (type_size == 32)
+                {
+                    return PROTOBUF_3_TYPE_INT32;
+                }
+            }
+
+        /* Signed types */
+        case CXType_Char_S:
+        case CXType_SChar:
+        case CXType_WChar:
+        case CXType_Short:
+        case CXType_Int:
+        case CXType_Long:
+        case CXType_LongLong:
+            {
+                /* TODO: Finish this implementation */
+                if (type_size > 64)
+                {
+                    return PROTOBUF_3_TYPE_INT64;
+                }
+                else if (type_size == 32)
+                {
+                    return PROTOBUF_3_TYPE_INT32;
+                }
+            }
+
+        case CXType_Float:
+            return PROTOBUF_3_TYPE_FLOAT;
+        case CXType_Double:
+            return PROTOBUF_3_TYPE_DOUBLE;
+
+        /* Could have u8[] or a char[] so call recursively on the base type */
+        case CXType_ConstantArray:
+            return sergen_base_c_type_to_protobuf_rec(&canonical, sergen_get_array_base_type(canonical));
+
+        /* No support for following types */
+        case CXType_UInt128:
+        case CXType_Int128:
+        case CXType_LongDouble:
+        case CXType_Float128:
+        case CXType_Float16:
+        case CXType_Complex:
+        case CXType_Pointer:
+        case CXType_BlockPointer:
+        case CXType_Record:
+        case CXType_Enum:
+        case CXType_Typedef:
+        case CXType_Elaborated:
+        case CXType_Half:
+        default:
+            return PROTOBUF_3_TYPE_INVALID;
+    }
+}
+
+ssize_t sergen_calculate_array_len(CXType array)
+{
+    CXType  base_field_type = array;
+    ssize_t array_len       = 1;
+    ssize_t base_field_num  = 0;
+
+    do
+    {
+        base_field_num = clang_getNumElements(base_field_type);
+        if (base_field_num == -1)
+        {
+            return -1;
+        }
+        base_field_type = clang_getElementType(base_field_type);
+        if (base_field_type.kind == CXType_Invalid)
+        {
+            return -1;
+        }
+        array_len *= base_field_num;
+    } while (base_field_type.kind == CXType_ConstantArray);
+
+    return array_len;
+}
+
+CXType sergen_get_array_base_type(CXType array)
+{
+    CXType return_type = {.data = {0}, .kind = CXType_Invalid};
+    if (array.kind != CXType_ConstantArray)
+    {
+        return_type.kind = CXType_Invalid;
+        return return_type;
+    }
+
+    CXType base_field_type = array;
+    while (base_field_type.kind == CXType_ConstantArray)
+    {
+        base_field_type = clang_getElementType(base_field_type);
+    }
+
+    return base_field_type;
 }
